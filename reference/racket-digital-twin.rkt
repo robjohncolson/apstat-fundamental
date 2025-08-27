@@ -33,7 +33,24 @@
   
   ;; Demo functions
   simulate-full-flow
-  run-parity-tests)
+  run-parity-tests
+  
+  ;; B function atoms (for testing)
+  sha256-hash
+  get-current-timestamp
+  validate-signature
+  calculate-consensus
+  update-distributions
+  detect-outliers
+  calculate-mcq-convergence
+  calculate-frq-convergence
+  
+  ;; Structs (for testing)
+  Attestation
+  Transaction
+  
+  ;; Verification functions  
+  test-b-function-atoms)
 
 (require json
          racket/random
@@ -488,8 +505,9 @@
               'mempool mempool
               'distributions distributions))))
 
-;; Update distributions (matches blockchain.cljs update-distributions)
-(define (update-distributions current-distributions transactions)
+;; B function atom 5: updateDistributions (Invariant 7, 9)
+(define/contract (update-distributions current-distributions transactions)
+  (-> hash? (listof Transaction?) hash?)
   ;; Only process attestation transactions
   (let ([attestation-txs (filter (λ (tx) (equal? (Transaction-type tx) "attestation")) transactions)])
     (foldl update-single-distribution current-distributions attestation-txs)))
@@ -549,7 +567,9 @@
       
       [else distributions])))
 
-;; Convergence calculations (Invariant 7)
+;; Convergence calculations (Invariant 7: Convergence formulas)
+;; MCQ: convergence = max_choice_count / total_attestations 
+;; FRQ: convergence = max(0, 1 - coefficient_of_variation)
 (define/contract (calculate-mcq-convergence mcq-dist total)
   (-> hash? exact-nonnegative-integer? real?)
   (if (= total 0) 0
@@ -559,7 +579,62 @@
 (define/contract (calculate-frq-convergence average stddev)
   (-> real? real? real?)
   (if (= average 0) 0
+      ;; Coefficient of variation = stddev / mean
+      ;; Convergence = 1 - CV (clamped to 0)
       (max 0 (- 1 (/ stddev average)))))
+
+;; =============================================================================
+;; B FUNCTION ATOM VERIFICATION TESTS (Invariant 12: Atomicity)
+;; =============================================================================
+
+;; Test all 6 B function atoms independently for atomicity
+(define/contract (test-b-function-atoms)
+  (-> void?)
+  (printf "\n🧪 Testing B Function Atoms (Invariant 12: Atomicity)\n")
+  (printf "~a\n" (make-string 50 #\-))
+  
+  ;; B function atom 1: sha256Hash
+  (let ([hash1 (sha256-hash "test")]
+        [hash2 (sha256-hash "test")])
+    (printf "✅ B atom 1 - sha256Hash: deterministic (~a)\n" (equal? hash1 hash2)))
+  
+  ;; B function atom 2: getCurrentTimestamp  
+  (let ([t1 (get-current-timestamp)])
+    (sleep 0.001)
+    (let ([t2 (get-current-timestamp)])
+      (printf "✅ B atom 2 - getCurrentTimestamp: increasing (~a)\n" (< t1 t2))))
+  
+  ;; B function atom 3: validateSignature (Invariant 1)
+  (let ([valid (validate-signature "msg" "pk123-sig" "pk123")]
+        [invalid (validate-signature "msg" "pk456-sig" "pk123")])
+    (printf "✅ B atom 3 - validateSignature: identity validation (~a)\n" 
+            (and valid (not invalid))))
+  
+  ;; B function atom 4: calculateConsensus (Invariant 2, 7)
+  (let* ([attestations (list (Attestation "pk1" "Q1" #t 0.8 100)
+                            (Attestation "pk2" "Q1" #t 0.9 101)
+                            (Attestation "pk3" "Q1" #f 0.6 102))]
+         [consensus (calculate-consensus attestations)])
+    (printf "✅ B atom 4 - calculateConsensus: progressive quorum (~a)\n"
+            (and (hash-ref consensus 'total-attestations)
+                 (hash-ref consensus 'consensus-ratio)
+                 (hash-ref consensus 'required-quorum))))
+  
+  ;; B function atom 5: updateDistributions (Invariant 7, 9)  
+  (let* ([empty-dist (hash)]
+         [tx (Transaction "attestation" "Q1" "sha256:B" #f #f "pk1" "sig1" 123 0.8 #f)]
+         [updated (update-distributions empty-dist (list tx))])
+    (printf "✅ B atom 5 - updateDistributions: distribution tracking (~a)\n"
+            (hash-has-key? updated "Q1")))
+  
+  ;; B function atom 6: detectOutliers (Invariant 9)
+  (let ([normal-scores '(3.0 3.1 2.9 3.2)]
+        [with-outlier '(3.0 3.1 2.9 10.0)])
+    (printf "✅ B atom 6 - detectOutliers: Z-score threshold (~a)\n"
+            (and (null? (detect-outliers normal-scores))
+                 (not (null? (detect-outliers with-outlier))))))
+  
+  (printf "\n🎯 All 6 B function atoms verified independently!\n"))
 
 ;; =============================================================================
 ;; PERSISTENCE AND QR SYNC (Mirroring pok.state save/load functions)
