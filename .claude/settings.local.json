@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(racket:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(raco test:*)"
     ],
     "deny": [],
     "ask": []
