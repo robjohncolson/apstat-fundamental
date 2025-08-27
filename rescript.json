@@ -1,0 +1,15 @@
+{
+  "name": "apstat-fundamental",
+  "version": "1.0.0",
+  "sources": {
+    "dir": "src",
+    "subdirs": true
+  },
+  "package-specs": {
+    "module": "esmodule",
+    "in-source": true
+  },
+  "warnings": {
+    "number": "-40"
+  }
+}

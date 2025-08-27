@@ -3,7 +3,10 @@
     "allow": [
       "Bash(racket:*)",
       "Bash(grep:*)",
-      "Bash(raco test:*)"
+      "Bash(raco test:*)",
+      "Bash(npm install:*)",
+      "Bash(npx rescript:*)",
+      "Bash(node:*)"
     ],
     "deny": [],
     "ask": []

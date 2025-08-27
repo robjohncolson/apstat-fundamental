@@ -943,3 +943,4 @@
   (printf "✓ Invariant validation: Identity and rate limit checks working\n")
   
   (printf "All digital twin tests passed!\n"))
+  (provide (all-defined-out))
