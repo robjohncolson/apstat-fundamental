@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(racket:*)",
+      "Bash(grep:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

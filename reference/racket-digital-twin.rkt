@@ -68,17 +68,48 @@
 ;; Reputation constants (from pok.reputation)
 (define REPUTATION-DECAY-RATE 0.05)
 (define TIME-WINDOW-HOURS 24)
-(define MIN-QUORUM-SIZE 2)  ; CLJS uses MVP quorum=2
 (define CONSENSUS-THRESHOLD 0.67)
-(define MINORITY-BONUS-MULTIPLIER 1.5)
 (define MAX-REPUTATION-SCORE 1000.0)
+
+;; Mathematical specification constants (58-atom model)
+;; Invariant 2: Progressive Quorum sizes
+(define MIN-QUORUM-SIZE 3)     ; Low convergence
+(define MED-QUORUM-SIZE 4)     ; Medium convergence  
+(define MAX-QUORUM-SIZE 5)     ; High convergence
+(define CONVERGENCE-THRESHOLD-LOW 0.4)
+(define CONVERGENCE-THRESHOLD-HIGH 0.8)
+
+;; Invariant 3: Confidence-weighted rewards
+(define CONFIDENCE-WEIGHT-FACTOR 2.0)
+(define MINORITY-BONUS-MULTIPLIER 1.5)
+(define MINORITY-THRESHOLD 0.3)
+
+;; Invariant 5: FRQ scoring bounds  
+(define FRQ-MIN-SCORE 1.0)
+(define FRQ-MAX-SCORE 5.0)
+
+;; Invariant 8: Rate limiting
+(define RATE-LIMIT-DAYS 30)
+(define RATE-LIMIT-SECONDS (* RATE-LIMIT-DAYS 24 60 60))
+
+;; Invariant 9: Outlier detection
+(define OUTLIER-Z-SCORE-THRESHOLD 3.0)
 
 ;; =============================================================================
 ;; DATA STRUCTURES (Mirroring CLJS records and maps)
 ;; =============================================================================
 
-;; Profile record (matches pok.state Profile)
-(struct Profile (username archetype pubkey privkey reputation-score) #:transparent #:mutable)
+;; Profile record - Contains P data atoms (7):
+;; username, pubkey, privkey, reputation-score, history, streak, archetype
+(struct Profile (
+  username           ; P data atom 1
+  pubkey            ; P data atom 2
+  privkey           ; P data atom 3
+  reputation-score  ; P data atom 4
+  history          ; P data atom 5 - list of attestation IDs
+  streak           ; P data atom 6 - consecutive correct attestations
+  archetype        ; P data atom 7
+) #:transparent #:mutable)
 
 ;; App database state (matches Re-frame db structure)
 (struct AppDB (
@@ -99,16 +130,18 @@
   unlocked
 ) #:transparent #:mutable)
 
-;; Transaction structure (matches blockchain.cljs create-tx)
+;; Transaction structure - Contains B data atoms
 (struct Transaction (
-  type
-  question-id
-  answer-hash
-  answer-text
-  score
-  attester-pubkey
-  signature
-  timestamp
+  type              ; B data atom: txType
+  question-id       ; B data atom: questionId
+  answer-hash       ; B data atom: answerHash (MCQ)
+  answer-text       ; B data atom: answerText (FRQ)
+  score            ; B data atom: score (FRQ)
+  attester-pubkey  ; B data atom: attesterPubkey
+  signature        ; B data atom: signature
+  timestamp        ; B data atom: timestamp
+  confidence       ; B data atom: confidence (0.0-1.0)
+  anonymous-sig    ; B data atom: anonymousSignature (for AP reveals)
 ) #:transparent)
 
 ;; Block structure (matches blockchain.cljs mine-block)
@@ -121,14 +154,25 @@
   nonce
 ) #:transparent)
 
-;; Distribution tracking (matches ADR-028 specification)
+;; Distribution tracking - B data atoms for consensus
 (struct QuestionDistribution (
-  question-id
-  total-attestations
-  mcq-distribution
-  frq-distribution
-  convergence-score
+  question-id             ; B data atom: questionId
+  total-attestations      
+  mcq-distribution       ; B data atom: mcqDistribution
+  frq-scores            ; B data atom: frqScores
+  convergence           ; B data atom: convergence
+  confidence-scores     ; List of confidence values
+  official-answer       ; B data atom: officialAnswer (None until AP reveal)
   last-updated
+) #:transparent)
+
+;; Attestation - Additional B data atoms for consensus
+(struct Attestation (
+  validator-pubkey
+  question-id
+  is-match         ; B data atom: isMatch
+  confidence
+  timestamp
 ) #:transparent)
 
 ;; =============================================================================
@@ -142,6 +186,53 @@
 ;; SHA-256 hash (matches blockchain.cljs sha256-hash - mock version)
 (define (sha256-hash text)
   (string-append "sha256:" text))
+
+;; Get current timestamp
+(define (get-current-timestamp)
+  (current-inexact-milliseconds))
+
+;; =============================================================================
+;; BLOCKCHAIN (B) FUNCTION ATOMS - 6 total
+;; =============================================================================
+
+;; B function atom 3: validateSignature (Invariant 1)
+(define/contract (validate-signature message signature pubkey)
+  (-> string? string? string? boolean?)
+  ;; Simplified validation - in production would use real crypto
+  (string-suffix? signature (string-append pubkey "-sig")))
+
+;; B function atom 6: detectOutliers (Invariant 9)
+(define/contract (detect-outliers scores)
+  (-> (listof real?) (listof real?))
+  (if (< (length scores) 3)
+      '()  ; Need at least 3 scores for statistical analysis
+      (let* ([mean (/ (apply + scores) (length scores))]
+             [variance (/ (apply + (map (λ (x) (expt (- x mean) 2)) scores)) (length scores))]
+             [stddev (sqrt variance)])
+        (filter (λ (score)
+                 (> (abs (/ (- score mean) (max stddev 0.001))) 
+                    OUTLIER-Z-SCORE-THRESHOLD))
+                scores))))
+
+;; B function atom 4: calculateConsensus (Invariant 2, 7)
+(define/contract (calculate-consensus attestations)
+  (-> (listof Attestation?) (hash/c symbol? any/c))
+  (let* ([matches (filter Attestation-is-match attestations)]
+         [total (length attestations)]
+         [consensus-ratio (if (> total 0) (/ (length matches) total) 0)]
+         [avg-confidence (if (> total 0)
+                            (/ (apply + (map Attestation-confidence attestations)) total)
+                            0)]
+         ;; Invariant 2: Progressive quorum based on convergence
+         [required-quorum (cond
+                           [(< avg-confidence CONVERGENCE-THRESHOLD-LOW) MIN-QUORUM-SIZE]
+                           [(< avg-confidence CONVERGENCE-THRESHOLD-HIGH) MED-QUORUM-SIZE]
+                           [else MAX-QUORUM-SIZE])])
+    (hash 'consensus-reached (>= total required-quorum)
+          'consensus-ratio consensus-ratio
+          'average-confidence avg-confidence
+          'required-quorum required-quorum
+          'total-attestations total)))
 
 ;; Generate seedphrase (matches pok.state generate-seedphrase)
 (define (generate-seedphrase)
@@ -166,6 +257,38 @@
     [(and (>= accuracy 0.6) (<= accuracy 0.8) (>= questions-answered 20)) 'learners]
     ;; Explorers: New users or those still discovering the system
     [else 'explorers]))
+
+;; P function atom 4: update-profile
+(define/contract (update-profile profile attestation-result)
+  (-> Profile? (hash/c symbol? any/c) Profile?)
+  (let* ([is-correct (hash-ref attestation-result 'is-match #f)]
+         [new-streak (if is-correct 
+                        (+ (Profile-streak profile) 1)
+                        0)]
+         [new-history (cons (hash-ref attestation-result 'question-id)
+                           (Profile-history profile))])
+    (set-Profile-streak! profile new-streak)
+    (set-Profile-history! profile new-history)
+    profile))
+
+;; Create transaction with all B data atoms
+(define/contract (create-transaction question-id answer question-type pubkey privkey confidence)
+  (-> string? any/c string? string? string? (real-in 0 1) Transaction?)
+  (cond
+    [(or (equal? question-type "multiple-choice") (equal? question-type "mcq"))
+     (Transaction "attestation" question-id (sha256-hash (~a answer)) #f #f 
+                  pubkey (string-append privkey "-sig") (get-current-timestamp)
+                  confidence #f)]  ; No anonymous sig in regular attestation
+    [(or (equal? question-type "free-response") (equal? question-type "frq"))
+     (let ([score (if (hash? answer) (hash-ref answer 'score) 3.0)]
+           [text (if (hash? answer) (hash-ref answer 'text) answer)])
+       ;; Invariant 5: FRQ score bounds
+       (unless (and (>= score FRQ-MIN-SCORE) (<= score FRQ-MAX-SCORE))
+         (error "FRQ score out of bounds" score))
+       (Transaction "attestation" question-id #f text score
+                    pubkey (string-append privkey "-sig") (get-current-timestamp)
+                    confidence #f))]
+    [else (error "Unknown question type")]))
 
 ;; =============================================================================
 ;; STATE MANAGEMENT (Mirroring Re-frame events and subscriptions)
@@ -220,8 +343,8 @@
               [current-seedphrase (if needs-seed (generate-seedphrase) (AppDB-seedphrase db))]
               [keys (if needs-seed (derive-keys-from-seed current-seedphrase) 
                        (hash 'privkey (AppDB-privkey db) 'pubkey (AppDB-pubkey db)))]
-              [new-profile (Profile username 'explorers (hash-ref keys 'pubkey) 
-                                   (hash-ref keys 'privkey) 100.0)]
+              [new-profile (Profile username (hash-ref keys 'pubkey) (hash-ref keys 'privkey)
+                                   100.0 '() 0 'explorers)]
               [user-tx (Transaction "create-user" 
                                    username ; question-id is username for create-user tx
                                    #f ; answer-hash
@@ -229,7 +352,10 @@
                                    #f ; score
                                    (hash-ref keys 'pubkey)
                                    (string-append (hash-ref keys 'privkey) "-mock-sig")
-                                   (current-inexact-milliseconds))])
+                                   (current-inexact-milliseconds)
+                                   1.0 ; confidence
+                                   #f ; anonymous-sig
+                                   )])
          (when needs-seed
            (set-AppDB-seedphrase! db current-seedphrase)
            (set-AppDB-privkey! db (hash-ref keys 'privkey))
@@ -249,7 +375,7 @@
              (let* ([current-question (AppDB-current-question db)]
                     [question-type "multiple-choice"] ; Force MCQ for demo simplicity
                     [tx (create-transaction question-id answer question-type 
-                                           (AppDB-pubkey db) (AppDB-privkey db))])
+                                           (AppDB-pubkey db) (AppDB-privkey db) 0.8)])
                (dispatch-event (list 'add-to-mempool tx))
                (printf "[EVENT] Answer submitted: Q=~a A=~a\n" question-id answer))))]
       
@@ -296,16 +422,6 @@
 ;; BLOCKCHAIN OPERATIONS (Mirroring blockchain.cljs exactly)
 ;; =============================================================================
 
-;; Create transaction (matches blockchain.cljs create-tx)
-(define (create-transaction question-id answer question-type pubkey privkey)
-  (cond
-    [(or (equal? question-type "multiple-choice") (equal? question-type "mcq"))
-     (Transaction "attestation" question-id (sha256-hash (~a answer)) #f #f 
-                  pubkey (string-append privkey "-mock-sig") (current-inexact-milliseconds))]
-    [(or (equal? question-type "free-response") (equal? question-type "frq"))
-     (Transaction "attestation" question-id #f (hash-ref answer 'text) (hash-ref answer 'score)
-                  pubkey (string-append privkey "-mock-sig") (current-inexact-milliseconds))]
-    [else (error "Unknown question type")]))
 
 ;; Self-attestation for MVP (matches blockchain.cljs self-attest)
 (define (self-attest transaction correct-answer)
@@ -381,7 +497,10 @@
 (define (update-single-distribution tx distributions)
   (let* ([qid (Transaction-question-id tx)]
          [current-dist (hash-ref distributions qid #f)]
-         [total (if current-dist (QuestionDistribution-total-attestations current-dist) 0)])
+         [total (if current-dist (QuestionDistribution-total-attestations current-dist) 0)]
+         [confidence (if (Transaction? tx)
+                        (Transaction-confidence tx)
+                        0.5)])
     
     (cond
       ;; MCQ transaction
@@ -394,37 +513,51 @@
                            (QuestionDistribution-mcq-distribution current-dist)
                            (hash 'A 0 'B 0 'C 0 'D 0 'E 0))]
               [updated-mcq (hash-update mcq-dist (string->symbol choice) (λ (old) (+ old 1)) 0)]
+              [confidence-scores (cons confidence
+                                     (if current-dist
+                                         (QuestionDistribution-confidence-scores current-dist)
+                                         '()))]
               [convergence (calculate-mcq-convergence updated-mcq (+ total 1))]
               [new-dist (QuestionDistribution qid (+ total 1) updated-mcq #f 
-                                            convergence (current-inexact-milliseconds))])
+                                            convergence confidence-scores #f (get-current-timestamp))])
          (hash-set distributions qid new-dist))]
       
       ;; FRQ transaction
       [(Transaction-answer-text tx)
        (let* ([score (Transaction-score tx)]
               [frq-dist (if current-dist 
-                           (QuestionDistribution-frq-distribution current-dist)
-                           (hash 'scores '() 'average 0 'stddev 0))]
-              [new-scores (cons score (hash-ref frq-dist 'scores))]
-              [new-average (/ (apply + new-scores) (length new-scores))]
-              [variance (/ (apply + (map (λ (x) (expt (- x new-average) 2)) new-scores))
-                          (length new-scores))]
+                           (QuestionDistribution-frq-scores current-dist)
+                           '())]
+              [existing-scores (if (list? frq-dist) frq-dist '())]
+              [new-scores (cons score existing-scores)]
+              ;; Invariant 9: Detect and exclude outliers
+              [outliers (detect-outliers new-scores)]
+              [clean-scores (filter (λ (s) (not (member s outliers))) new-scores)]
+              [new-average (if (null? clean-scores) 0 (/ (apply + clean-scores) (length clean-scores)))]
+              [variance (if (null? clean-scores) 0
+                          (/ (apply + (map (λ (x) (expt (- x new-average) 2)) clean-scores))
+                             (length clean-scores)))]
               [new-stddev (sqrt variance)]
-              [updated-frq (hash 'scores new-scores 'average new-average 'stddev new-stddev)]
+              [confidence-scores (cons confidence
+                                     (if current-dist
+                                         (QuestionDistribution-confidence-scores current-dist)
+                                         '()))]
               [convergence (calculate-frq-convergence new-average new-stddev)]
-              [new-dist (QuestionDistribution qid (+ total 1) #f updated-frq
-                                            convergence (current-inexact-milliseconds))])
+              [new-dist (QuestionDistribution qid (+ total 1) #f clean-scores
+                                            convergence confidence-scores #f (get-current-timestamp))])
          (hash-set distributions qid new-dist))]
       
       [else distributions])))
 
-;; Convergence calculation (matches blockchain.cljs calculate-convergence)
-(define (calculate-mcq-convergence mcq-dist total)
+;; Convergence calculations (Invariant 7)
+(define/contract (calculate-mcq-convergence mcq-dist total)
+  (-> hash? exact-nonnegative-integer? real?)
   (if (= total 0) 0
       (let ([max-choice (apply max (hash-values mcq-dist))])
         (/ max-choice total))))
 
-(define (calculate-frq-convergence average stddev)
+(define/contract (calculate-frq-convergence average stddev)
+  (-> real? real? real?)
   (if (= average 0) 0
       (max 0 (- 1 (/ stddev average)))))
 
@@ -631,7 +764,7 @@
   (dispatch-event '(create-profile "test-user"))
   (let* ([db (*app-db*)]
          [tx (create-transaction "U1-L1-Q01" "A" "multiple-choice"
-                                (AppDB-pubkey db) (AppDB-privkey db))])
+                                (AppDB-pubkey db) (AppDB-privkey db) 0.8)])
     (printf "✓ Transaction structure: ~a\n" 
             (and (equal? (Transaction-type tx) "attestation")
                  (string? (Transaction-answer-hash tx)))))
@@ -690,7 +823,7 @@
   (dispatch-event '(create-profile "test-user"))
   (let* ([db (*app-db*)]
          [mcq-tx (create-transaction "U1-L1-Q01" "A" "multiple-choice"
-                                    (AppDB-pubkey db) (AppDB-privkey db))])
+                                    (AppDB-pubkey db) (AppDB-privkey db) 0.8)])
     (check-equal? (Transaction-type mcq-tx) "attestation")
     (check-true (string? (Transaction-answer-hash mcq-tx))))
   
